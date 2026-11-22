@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Translator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&family=Noto+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#EEF2F1; --surface:#FFFFFF; --ink:#13201D; --muted:#5B6B67;
+    --a:#0E7C86; --b:#E0603A; --line:#D3DCDA; --stop:#B3261E;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#0F1716; --surface:#172220; --ink:#E7F0EE; --muted:#97A9A5; --line:#2A3A37;}
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{font-family:'Noto Sans',system-ui,sans-serif;background:var(--bg);color:var(--ink);min-height:100vh;padding:20px 16px 40px;display:flex;justify-content:center}
+  main{width:100%;max-width:760px}
+  h1{font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:clamp(28px,6vw,44px);margin:8px 0 4px;letter-spacing:-.02em}
+  .sub{color:var(--muted);margin:0 0 22px}
+  .pair{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:end}
+  .swap{font-size:22px;color:var(--muted);padding-bottom:10px}
+  label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+  select{width:100%;padding:12px;font:inherit;color:var(--ink);background:var(--surface);border:2px solid var(--line);border-radius:10px}
+  #l1{border-color:var(--a)} #l2{border-color:var(--b)}
+  select:focus-visible,button:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+  .stage{margin:22px 0;padding:22px;border-radius:18px;background:var(--surface);border:2px solid var(--line);text-align:center;transition:border-color .2s}
+  .stage.u1{border-color:var(--a)} .stage.u2{border-color:var(--b)}
+  .state{font-family:'Bricolage Grotesque',sans-serif;font-weight:700;font-size:clamp(22px,5vw,32px);margin:0}
+  .hint{color:var(--muted);margin:6px 0 0;min-height:22px}
+  .orb{width:84px;height:84px;border-radius:50%;margin:0 auto 14px;background:var(--line);transition:background .2s}
+  .stage.u1 .orb{background:var(--a)} .stage.u2 .orb{background:var(--b)}
+  .stage.listening .orb{animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.14)}}
+  @media (prefers-reduced-motion:reduce){.stage.listening .orb{animation:none}}
+  .controls{display:flex;gap:10px}
+  button{flex:1;padding:16px;font:inherit;font-weight:700;font-size:17px;border:0;border-radius:12px;cursor:pointer;color:#fff}
+  #start{background:var(--a)} #stop{background:var(--stop)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  #log{margin-top:22px;display:flex;flex-direction:column;gap:10px}
+  .msg{padding:12px 14px;border-radius:12px;background:var(--surface);border-left:6px solid var(--line)}
+  .msg.u1{border-left-color:var(--a)} .msg.u2{border-left-color:var(--b)}
+  .msg small{color:var(--muted);display:block;margin-bottom:4px}
+  .msg .orig{font-weight:500} .msg .tr{margin-top:4px;color:var(--muted)}
+  .msg .fix{flex:none;padding:6px 10px;font-size:13px;font-weight:500;margin-top:8px;background:var(--line);color:var(--ink)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Live Translator</h1>
+  <p class="sub">Do log, do bhashayein. Bas bolo, baaki agent sambhal lega.</p>
+
+  <div class="pair">
+    <div><label for="l1">User 1 ki bhasha</label><select id="l1"></select></div>
+    <div class="swap" aria-hidden="true">⇄</div>
+    <div><label for="l2">User 2 ki bhasha</label><select id="l2"></select></div>
+  </div>
+
+  <section class="stage" id="stage" aria-live="polite">
+    <div class="orb"></div>
+    <p class="state" id="state">Ready</p>
+    <p class="hint" id="hint">Bhasha chuno aur Start dabao.</p>
+  </section>
+
+  <div class="controls">
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+  <div id="log"></div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const l1 = $("l1"), l2 = $("l2");
+const session = crypto.randomUUID();
+let running = false, ctx, stream, proc, mic, mute, onFrame = null, cancelRec = null, currentSrc = null, abortCtl = null;
+let langs = {};
+
+fetch("/api/languages").then(r => r.json()).then(list => {
+  list.forEach(l => { langs[l.code] = l.name; l1.add(new Option(l.name, l.code)); l2.add(new Option(l.name, l.code)); });
+  l1.value = "hi"; l2.value = "en";
+});
+
+function setState(title, hint, who, listening){
+  $("state").textContent = title; $("hint").textContent = hint || "";
+  $("stage").className = "stage" + (who ? " u"+who : "") + (listening ? " listening" : "");
+}
+
+/* ---------- Mic + silence detection ---------- */
+async function initAudio(){
+  stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  mic = ctx.createMediaStreamSource(stream);
+  proc = ctx.createScriptProcessor(4096, 1, 1);
+  mute = ctx.createGain(); mute.gain.value = 0;
+  proc.onaudioprocess = e => { if (onFrame) onFrame(new Float32Array(e.inputBuffer.getChannelData(0))); };
+  mic.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+}
+
+function rms(a){ let s=0; for (let i=0;i<a.length;i++) s+=a[i]*a[i]; return Math.sqrt(s/a.length); }
+
+// Ek utterance record karo: bolna shuru -> ruk jao (1.2s silence) -> Float32 samples return
+function recordUtterance(){
+  return new Promise(resolve => {
+    const rate = ctx.sampleRate;
+    let calib = [], thr = 0.015, started = false, silence = 0, total = 0, voiced = 0;
+    let pre = [], chunks = [];
+    const finish = val => { onFrame = null; cancelRec = null; resolve(val); };
+    cancelRec = () => finish(null);
+    onFrame = f => {
+      const dur = f.length / rate, level = rms(f);
+      if (calib.length < 5){ calib.push(level); if (calib.length === 5) thr = Math.max(0.015, 2.5 * calib.reduce((a,b)=>a+b)/5); return; }
+      if (level > thr){
+        if (!started){ started = true; chunks = pre.slice(); }
+        silence = 0; voiced += dur; chunks.push(f);
+      } else if (started){
+        silence += dur; chunks.push(f);
+      } else { pre.push(f); if (pre.length > 2) pre.shift(); }
+      if (started) total += dur;
+      if (started && silence > 1.2) finish(voiced > 0.25 ? concat(chunks) : new Float32Array(0));
+      else if (total > 30) finish(concat(chunks));
+    };
+  });
+}
+function concat(arr){ const n = arr.reduce((s,a)=>s+a.length,0), out = new Float32Array(n); let o=0; arr.forEach(a=>{out.set(a,o);o+=a.length}); return out; }
+
+function toWav16k(samples, inRate){
+  const outRate = 16000, ratio = inRate / outRate, n = Math.floor(samples.length / ratio);
+  const pcm = new Int16Array(n);
+  for (let i=0;i<n;i++){
+    const s = Math.floor(i*ratio), e = Math.min(samples.length, Math.floor((i+1)*ratio));
+    let sum=0; for (let j=s;j<e;j++) sum+=samples[j];
+    const v = Math.max(-1, Math.min(1, sum/Math.max(1,e-s)));
+    pcm[i] = v < 0 ? v*0x8000 : v*0x7FFF;
+  }
+  const buf = new ArrayBuffer(44 + pcm.length*2), dv = new DataView(buf);
+  const w = (o,s)=>{for(let i=0;i<s.length;i++)dv.setUint8(o+i,s.charCodeAt(i))};
+  w(0,"RIFF"); dv.setUint32(4,36+pcm.length*2,true); w(8,"WAVE"); w(12,"fmt ");
+  dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+  dv.setUint32(24,outRate,true); dv.setUint32(28,outRate*2,true); dv.setUint16(32,2,true); dv.setUint16(34,16,true);
+  w(36,"data"); dv.setUint32(40,pcm.length*2,true);
+  new Int16Array(buf,44).set(pcm);
+  return new Blob([buf], {type:"audio/wav"});
+}
+
+/* ---------- Backend call + playback ---------- */
+async function callAgent(blob, src, dst){
+  abortCtl = new AbortController();
+  const fd = new FormData();
+  fd.append("audio", blob, "speech.wav"); fd.append("src", src); fd.append("dst", dst); fd.append("session", session);
+  const r = await fetch("/api/turn", {method:"POST", body:fd, signal:abortCtl.signal});
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || "Server error " + r.status);
+  return r.json();
+}
+function playB64(b64){
+  return new Promise(async (resolve, reject) => {
+    try {
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+      const buf = await ctx.decodeAudioData(bytes);
+      const s = ctx.createBufferSource(); s.buffer = buf; s.connect(ctx.destination);
+      currentSrc = s; s.onended = () => { currentSrc = null; resolve(); }; s.start();
+    } catch(e){ reject(e); }
+  });
+}
+function addLog(who, orig, tr, src, dst){
+  const d = document.createElement("div"); d.className = "msg u"+who;
+  d.innerHTML = `<small>User ${who} · ${langs[src]} → ${langs[dst]}</small><div class="orig"></div><div class="tr"></div>`;
+  d.querySelector(".orig").textContent = orig; d.querySelector(".tr").textContent = tr;
+  const b = document.createElement("button"); b.className = "fix"; b.textContent = "Translation galat hai? Sudhaaro";
+  b.onclick = async () => {
+    const n = prompt("Sahi translation likho:", d.querySelector(".tr").textContent);
+    if (!n) return;
+    await fetch("/api/correct", {method:"POST", body:new URLSearchParams({src, dst, text:orig, translation:n})});
+    d.querySelector(".tr").textContent = n; b.textContent = "Yaad kar liya ✓";
+  };
+  d.appendChild(b);
+  $("log").prepend(d);
+}
+
+/* ---------- Main loop ---------- */
+async function loop(){
+  let turn = 1;
+  while (running){
+    const src = turn === 1 ? l1.value : l2.value, dst = turn === 1 ? l2.value : l1.value;
+    try {
+      setState(`User ${turn}, bolo`, `${langs[src]} me bolo, ruko to main translate karunga`, turn, true);
+      const samples = await recordUtterance();
+      if (!running || !samples) break;
+      if (samples.length === 0) continue;
+
+      setState("Soch raha hu...", "Translate ho raha hai", turn, false);
+      const res = await callAgent(toWav16k(samples, ctx.sampleRate), src, dst);
+      if (!running) break;
+      if (!res.transcript){ continue; }              // noise tha, dobara suno
+
+      const other = turn === 1 ? 2 : 1;
+      addLog(turn, res.transcript, res.translation, src, dst);
+      setState(`User ${other} sun raha hai`, res.translation, other, false);
+      await playB64(res.audio);
+      if (!running) break;
+      turn = other;
+    } catch(err){
+      if (!running) break;
+      console.error(err);
+      setState("Error", err.message, null, false);
+      stopAll(false); return;
+    }
+  }
+}
+
+async function startAll(){
+  if (l1.value === l2.value){ setState("Alag bhasha chuno","Dono users ki bhasha same hai",null,false); return; }
+  try { if (!ctx) await initAudio(); else await ctx.resume(); }
+  catch(e){ setState("Mic nahi mila","Browser me mic permission allow karo",null,false); return; }
+  running = true;
+  $("start").disabled = true; $("stop").disabled = false; l1.disabled = l2.disabled = true;
+  loop();
+}
+function stopAll(resetMsg = true){
+  running = false;
+  if (cancelRec) cancelRec();
+  if (abortCtl) abortCtl.abort();
+  if (currentSrc){ try{ currentSrc.stop(); }catch(e){} }
+  fetch("/api/reset", {method:"POST", body:new URLSearchParams({session})});
+  $("start").disabled = false; $("stop").disabled = true; l1.disabled = l2.disabled = false;
+  if (resetMsg) setState("Stopped","Dobara shuru karne ke liye Start dabao.",null,false);
+}
+$("start").onclick = startAll;
+$("stop").onclick = () => stopAll(true);
+</script>
+</body>
+</html>

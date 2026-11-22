@@ -1,0 +1,15 @@
+# Virtual environment
+venv/
+.venv/
+
+# Downloaded models (GBs, GitHub limit 100MB per file). Users run download_models.py
+models/
+
+# Learned data / user corrections (private)
+data/
+
+# Secrets and caches
+.env
+__pycache__/
+*.pyc
+.vscode/

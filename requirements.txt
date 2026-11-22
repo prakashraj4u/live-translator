@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
+torch
+transformers
+sentencepiece
+huggingface_hub
+ctranslate2
+faster-whisper
